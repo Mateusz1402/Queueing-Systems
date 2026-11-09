@@ -1,19 +1,160 @@
 import streamlit as st
 import random
 import heapq
+import numpy as np
 import pandas as pd
 from collections import deque
 
-#symulator systemu kolejkowego zamkniętego (przykład magazynu)
-#M/M/m/FIFO/N/F
+# Symulator zamkniętego systemu kolejkowego z obsługą indywidualną (przykład magazynu)
+# M/M_i/m/FIFO/N/F  -  każdy robot ma własną intensywność obsługi μ_i
+#
+# kanały obsługi       - roboty w magazynie (robot i obsługuje z intensywnością μ_i)
+# źródła zgłoszeń      - doki/bramy magazynowe (każdy generuje paczki z intensywnością λ)
+# N                    - maks. liczba paczek w systemie (w obsłudze + w kolejce)
+#
+# Ponieważ roboty są różne, liczy się KTÓRY robot dostaje paczkę. Reguła przydziału:
+#   - "Kolejność robotów"  - pierwszy wolny robot wg numeru (robot 1 ma pierwszeństwo)
+#   - "Najszybszy wolny"   - wolny robot o największym μ_i
+#
+# Paczka, która przychodzi do pełnego systemu (N paczek), czeka przed wejściem
+# (dok jest zablokowany) i wchodzi do kolejki, gdy zwolni się miejsce.
 
-# kanały obsługi - roboty w magazynie
-# źródłą zdarzeń - doki/bramy magazynowe
-# max. liczba zdarzeń - zdarzenia już obsługiwane + czekające w kolejce
+RULE_ORDER = "Kolejność robotów (robot 1 ma pierwszeństwo)"
+RULE_FASTEST = "Najszybszy wolny robot (największe μ)"
 
-def simulate(F, m, N, lam, mu, sim_time, seed):
+MAX_STATES = 6000
+
+
+def robot_priority(mus, rule):
+    """Kolejność, w jakiej sprawdzamy wolne roboty przy przydziale paczki."""
+    order = list(range(len(mus)))
+    if rule == RULE_FASTEST:
+        # stabilne sortowanie: przy równych μ decyduje numer robota
+        order.sort(key=lambda r: -mus[r])
+    return order
+
+
+# ---------------------------------------------------------------------------
+# Rozwiązanie analityczne - łańcuch Markowa z czasem ciągłym
+# ---------------------------------------------------------------------------
+# Stan: (b, q, k)
+#   b - krotka 0/1, który robot jest zajęty
+#   q - liczba paczek w kolejce
+#   k - liczba doków zablokowanych (paczka czeka przed pełnym systemem)
+# Rozwiązujemy równania równowagi  π Q = 0,  Σ π = 1.
+
+def analytic(F, m, N, lam, mus, rule):
+    order = robot_priority(mus, rule)
+
+    def first_free(b):
+        for r in order:
+            if not b[r]:
+                return r
+        return None
+
+    def enter(b, q):
+        """Paczka wchodzi do systemu: do wolnego robota albo do kolejki."""
+        r = first_free(b)
+        if r is None:
+            return b, q + 1
+        nb = list(b)
+        nb[r] = 1
+        return tuple(nb), q
+
+    def transitions(state):
+        b, q, k = state
+        n = sum(b) + q
+        out = []
+
+        # Nowe zgłoszenie z jednego z "aktywnych" doków
+        rate = (F - n - k) * lam
+        if rate > 0:
+            if n < N:
+                nb, nq = enter(b, q)
+                out.append(((nb, nq, k), rate))
+            else:
+                out.append(((b, q, k + 1), rate))
+
+        # Zakończenie obsługi przez robota i
+        for i in range(m):
+            if b[i]:
+                nb = list(b)
+                nb[i] = 0
+                nb = tuple(nb)
+                nq, nk = q, k
+                if nk > 0:                 # zablokowana paczka wchodzi do kolejki
+                    nk -= 1
+                    nq += 1
+                if nq > 0:                 # wolny robot bierze paczkę z kolejki
+                    nb, nq = enter(nb, nq - 1)
+                out.append(((nb, nq, nk), mus[i]))
+        return out
+
+    start = (tuple([0] * m), 0, 0)
+    index = {start: 0}
+    states = [start]
+    edges = []
+    i = 0
+    while i < len(states):
+        for target, rate in transitions(states[i]):
+            if target not in index:
+                if len(states) >= MAX_STATES:
+                    return None
+                index[target] = len(states)
+                states.append(target)
+            edges.append((i, index[target], rate))
+        i += 1
+
+    S = len(states)
+    Q = np.zeros((S, S))
+    for a, c, rate in edges:
+        Q[a, c] += rate
+        Q[a, a] -= rate
+
+    A = Q.T.copy()
+    A[-1, :] = 1.0
+    rhs = np.zeros(S)
+    rhs[-1] = 1.0
+    pi = np.linalg.solve(A, rhs)
+
+    busy = np.array([s[0] for s in states], dtype=float)   # S x m
+    q_arr = np.array([s[1] for s in states], dtype=float)
+    k_arr = np.array([s[2] for s in states], dtype=float)
+    n_arr = busy.sum(axis=1) + q_arr
+
+    util = pi @ busy                                       # P(robot i zajęty)
+    throughput = float(np.dot(util, mus))                  # paczek / s
+    L = float(pi @ n_arr)
+    Lq = float(pi @ q_arr)
+    K = float(pi @ k_arr)
+    p0 = float(pi[n_arr == 0].sum())
+
+    dist = pd.Series(pi).groupby(n_arr.astype(int)).sum()
+
+    return {
+        "states": S,
+        "p0": p0,
+        "util": util,
+        "avg_busy": float(util.sum()),
+        "throughput": throughput,
+        "L": L,
+        "Lq": Lq,
+        "K": K,
+        # Little: czas oczekiwania liczony od wygenerowania paczki przez dok
+        # (wliczamy czas czekania przed pełnym systemem - tak jak w symulacji)
+        "Wq": (Lq + K) / throughput if throughput > 0 else 0.0,
+        "W": (L + K) / throughput if throughput > 0 else 0.0,
+        "dist": dist,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Symulacja zdarzeń dyskretnych
+# ---------------------------------------------------------------------------
+
+def simulate(F, m, N, lam, mus, rule, sim_time, seed):
     random.seed(seed)
-
+    order = robot_priority(mus, rule)
 
     events = []
     event_counter = 0
@@ -24,21 +165,19 @@ def simulate(F, m, N, lam, mu, sim_time, seed):
     busy_servers = {}
 
     completed = 0
+    completed_per_robot = [0] * m
+    busy_time = [0.0] * m
     waiting_times = []
     system_times = []
     queue_history = [(0.0, 0)]
     system_history = [(0.0, 0)]
-    busy_intervals = []
 
     robot_history = {r: [(0.0, 0)] for r in range(m)}
 
     def schedule(time, event_type, source, server=None):
         nonlocal event_counter
         event_counter += 1
-        heapq.heappush(
-            events,
-            (time, event_counter, event_type, source, server)
-        )
+        heapq.heappush(events, (time, event_counter, event_type, source, server))
 
     def admit(source, arrival_time):
         nonlocal in_system
@@ -50,45 +189,24 @@ def simulate(F, m, N, lam, mu, sim_time, seed):
     def dispatch():
         while queue and len(busy_servers) < m:
             source, arrival_time = queue.popleft()
-            server = next(
-                s for s in range(m)
-                if s not in busy_servers
-            )
+            server = next(s for s in order if s not in busy_servers)
 
-            wait = current_time - arrival_time
-            waiting_times.append(wait)
+            waiting_times.append(current_time - arrival_time)
 
-            service_time = random.expovariate(mu)
-            finish_time = current_time + service_time
-
-            busy_servers[server] = (
-                source, arrival_time, current_time
-            )
-            # Robot staje się zajęty (1)
+            service_time = random.expovariate(mus[server])
+            busy_servers[server] = (source, arrival_time, current_time)
             robot_history[server].append((current_time, 1))
-
             queue_history.append((current_time, len(queue)))
 
-            schedule(
-                finish_time,
-                "departure",
-                source,
-                server
-            )
+            schedule(current_time + service_time, "departure", source, server)
 
-    # Początkowe zgłoszenia ze wszystkich źródeł
     for source in range(F):
-        arrival = random.expovariate(lam)
-        schedule(arrival, "arrival", source)
+        schedule(random.expovariate(lam), "arrival", source)
 
-    # Główna pętla symulacyjna
     while events:
-        event = heapq.heappop(events)
-        time, _, event_type, source, server = event
-
+        time, _, event_type, source, server = heapq.heappop(events)
         if time > sim_time:
             break
-
         current_time = time
 
         if event_type == "arrival":
@@ -100,18 +218,15 @@ def simulate(F, m, N, lam, mu, sim_time, seed):
 
         elif event_type == "departure":
             completed += 1
+            completed_per_robot[server] += 1
             old_source, arrival_time, start_time = busy_servers.pop(server)
 
-            busy_intervals.append((start_time, time))
+            busy_time[server] += time - start_time
             system_times.append(time - arrival_time)
             in_system -= 1
-
-            # Robot staje się wolny (0)
             robot_history[server].append((current_time, 0))
 
-            # Źródło generuje kolejne zgłoszenie
-            next_arrival = time + random.expovariate(lam)
-            schedule(next_arrival, "arrival", old_source)
+            schedule(time + random.expovariate(lam), "arrival", old_source)
 
             if blocked:
                 blocked_source, blocked_time = blocked.popleft()
@@ -120,152 +235,208 @@ def simulate(F, m, N, lam, mu, sim_time, seed):
             system_history.append((time, in_system))
             dispatch()
 
-    # Wykorzystanie robotów
-    total_busy = 0.0
-    for start, end in busy_intervals:
-        total_busy += max(0.0, min(end, sim_time) - start)
+    # Obsługi trwające w chwili końca symulacji też liczą się do czasu pracy
+    for server, (_, _, start_time) in busy_servers.items():
+        busy_time[server] += sim_time - start_time
 
-    utilization = (total_busy / (m * sim_time) * 100) if sim_time > 0 else 0
-    avg_wait = (sum(waiting_times) / len(waiting_times)) if waiting_times else 0
-    avg_system = (sum(system_times) / len(system_times)) if system_times else 0
+    def time_average(history, predicate=None):
+        total = 0.0
+        points = history + [(sim_time, history[-1][1])]
+        for (t0, v), (t1, _) in zip(points, points[1:]):
+            value = (1.0 if predicate(v) else 0.0) if predicate else v
+            total += value * (t1 - t0)
+        return total / sim_time
 
-    avg_queue = (
-        sum(
-            queue_history[i][1] * (queue_history[i + 1][0] - queue_history[i][0])
-            for i in range(len(queue_history) - 1)
-        ) / sim_time
-    ) if sim_time > 0 else 0
+    util = [bt / sim_time for bt in busy_time]
 
     return {
         "completed": completed,
-        "avg_wait": avg_wait,
-        "avg_system": avg_system,
-        "avg_queue": avg_queue,
-        "utilization": utilization,
+        "completed_per_robot": completed_per_robot,
+        "throughput": completed / sim_time,
+        "util": util,
+        "avg_busy": sum(util),
+        "avg_wait": (sum(waiting_times) / len(waiting_times)) if waiting_times else 0,
+        "avg_system": (sum(system_times) / len(system_times)) if system_times else 0,
+        "avg_queue": time_average(queue_history),
+        "avg_in_system": time_average(system_history),
+        "p0": time_average(system_history, lambda v: v == 0),
         "queue_history": queue_history,
         "system_history": system_history,
         "robot_history": robot_history,
         "waiting_times": waiting_times,
-        "system_times": system_times,
         "remaining": in_system,
         "remaining_queue": len(queue),
-        "blocked": len(blocked) + len(queue)
     }
 
 
-st.set_page_config(
-    page_title="Symulator magazynu",
-    layout="wide"
-)
+# ---------------------------------------------------------------------------
+# Interfejs
+# ---------------------------------------------------------------------------
+
+st.set_page_config(page_title="Symulator magazynu", layout="wide")
 
 st.title("Symulator systemu kolejkowego magazynu")
 st.markdown(
-    "Model M/M/m/FIFO/N/F – symulacja procesu "
+    "Zamknięty system z **obsługą indywidualną** M/M<sub>i</sub>/m/FIFO/N/F – "
+    "każdy robot ma własną intensywność obsługi μ<sub>i</sub>.",
+    unsafe_allow_html=True,
 )
 
 st.sidebar.header("Parametry symulacji")
 F = st.sidebar.number_input("Liczba punktów odbioru (F)", min_value=1, max_value=1000, value=10)
 m = st.sidebar.number_input("Liczba robotów (m)", min_value=1, max_value=100, value=3)
 N = st.sidebar.number_input("Pojemność systemu (N)", min_value=1, max_value=1000, value=20)
-lam = st.sidebar.number_input("Intensywność generowania paczek λ", min_value=0.01, max_value=100.0, value=0.5, step=0.1)
-mu = st.sidebar.number_input("Intensywność obsługi paczek μ", min_value=0.01, max_value=100.0, value=1.0, step=0.1)
-sim_time = st.sidebar.number_input("Czas symulacji [s]", min_value=1, max_value=100000, value=100)
+lam = st.sidebar.number_input("Intensywność generowania paczek λ (na dok)", min_value=0.01, max_value=100.0, value=0.5, step=0.1)
+
+st.sidebar.subheader("Intensywność obsługi robotów μᵢ")
+mus = []
+for r in range(int(m)):
+    mus.append(st.sidebar.number_input(
+        f"Robot {r + 1}: μ{r + 1}",
+        min_value=0.01, max_value=100.0,
+        value=round(max(0.2, 1.0 - 0.2 * r), 2), step=0.1,
+        key=f"mu_{r}",
+    ))
+
+rule = st.sidebar.radio("Przydział paczki do wolnego robota", [RULE_ORDER, RULE_FASTEST])
+
+sim_time = st.sidebar.number_input("Czas symulacji [s]", min_value=1, max_value=100000, value=1000)
 seed = st.sidebar.number_input("Ziarno generatora losowego", min_value=0, max_value=999999, value=42)
 
 st.sidebar.divider()
 run = st.sidebar.button("ROZPOCZNIJ SYMULACJĘ", type="primary", use_container_width=True)
 
 if run:
-    if N < 1 or m < 1 or F < 1:
-        st.error("Nieprawidłowe parametry.")
-    else:
-        with st.spinner("Trwa symulacja procesu magazynowania..."):
-            result = simulate(
-                int(F), int(m), int(N),
-                float(lam), float(mu), float(sim_time), int(seed)
-            )
+    F, m, N, sim_time, seed = int(F), int(m), int(N), float(sim_time), int(seed)
+    lam = float(lam)
+    mus = [float(x) for x in mus]
 
-        st.success("Symulacja została zakończona!")
+    with st.spinner("Trwa obliczanie i symulacja..."):
+        theory = analytic(F, m, N, lam, mus, rule)
+        result = simulate(F, m, N, lam, mus, rule, sim_time, seed)
 
-        # Wskaźniki
-        st.header("Wyniki symulacji")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Obsłużone paczki", result["completed"])
-        c2.metric("Średni czas oczekiwania", f'{result["avg_wait"]:.2f} s')
-        c3.metric("Średni czas w systemie", f'{result["avg_system"]:.2f} s')
-        c4.metric("Wykorzystanie robotów", f'{result["utilization"]:.2f}%')
+    st.success("Symulacja została zakończona!")
 
-        c5, c6, c7 = st.columns(3)
-        c5.metric("Średnia długość kolejki", f'{result["avg_queue"]:.2f}')
-        c6.metric("Paczki w systemie na koniec", result["remaining"])
-        c7.metric("Paczki w kolejce na koniec", result["remaining_queue"])
+    # ---------------- Rozwiązanie analityczne vs symulacja ----------------
+    st.header("Rozwiązanie systemu")
 
-        st.divider()
-
-        second_grid = list(range(int(sim_time) + 1))
-
-        df_q = pd.DataFrame(result["queue_history"], columns=["Czas", "Długość kolejki"]).drop_duplicates(subset=["Czas"], keep="last")
-        df_s = pd.DataFrame(result["system_history"], columns=["Czas", "Liczba paczek w systemie"]).drop_duplicates(subset=["Czas"], keep="last")
-
-        all_times_sys = sorted(set(second_grid).union(df_q["Czas"]).union(df_s["Czas"]))
-        df_sys_combined = pd.DataFrame(index=all_times_sys)
-        df_sys_combined = df_sys_combined.join(df_q.set_index("Czas")).join(df_s.set_index("Czas"))
-        df_sys_combined = df_sys_combined.ffill().fillna(0)
-        
-        df_system_seconds = df_sys_combined.loc[second_grid]
-        df_system_seconds.index.name = "Czas [s]"
-
-        st.subheader("Przebieg symulacji magazynu (próbkowanie co 1s)")
-        st.line_chart(
-            df_system_seconds,
-            x_label="Czas symulacji [s]",
-            y_label="Liczba paczek",
-            height=400
+    if theory is None:
+        st.warning(
+            f"Przestrzeń stanów przekracza {MAX_STATES} stanów – rozwiązanie analityczne "
+            "pominięte (zmniejsz liczbę robotów m). Poniżej tylko wyniki symulacji."
         )
+    else:
+        st.caption(f"Rozwiązanie analityczne: łańcuch Markowa, {theory['states']} stanów, stan ustalony.")
 
-        df_robots_seconds = pd.DataFrame(index=second_grid)
-        df_robots_seconds.index.name = "Czas [s]"
+    T = theory or {}
 
-        for r in range(int(m)):
-            r_df = pd.DataFrame(result["robot_history"][r], columns=["Czas", f"Robot {r+1}"]).drop_duplicates(subset=["Czas"], keep="last")
-            all_r_times = sorted(set(second_grid).union(r_df["Czas"]))
-            r_combined = pd.DataFrame(index=all_r_times).join(r_df.set_index("Czas")).ffill().fillna(0)
-            df_robots_seconds[f"Robot {r+1}"] = r_combined.loc[second_grid, f"Robot {r+1}"].astype(int)
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "P₀ – brak zgłoszeń, wszystkie roboty bez pracy",
+        f'{T["p0"]:.4f}' if theory else "—",
+        f'symulacja: {result["p0"]:.4f}', delta_color="off",
+    )
+    c2.metric(
+        "Średnia liczba paczek w obsłudze (zajętych robotów)",
+        f'{T["avg_busy"]:.3f}' if theory else "—",
+        f'symulacja: {result["avg_busy"]:.3f}', delta_color="off",
+    )
+    c3.metric(
+        "Średnia liczba obsłużonych paczek [1/s]",
+        f'{T["throughput"]:.3f}' if theory else "—",
+        f'symulacja: {result["throughput"]:.3f}', delta_color="off",
+    )
 
+    c4, c5, c6 = st.columns(3)
+    c4.metric(
+        f"Oczekiwana liczba obsłużonych paczek w {sim_time:.0f} s",
+        f'{T["throughput"] * sim_time:.1f}' if theory else "—",
+        f'symulacja: {result["completed"]}', delta_color="off",
+    )
+    c5.metric(
+        "Średnia długość kolejki",
+        f'{T["Lq"]:.3f}' if theory else "—",
+        f'symulacja: {result["avg_queue"]:.3f}', delta_color="off",
+    )
+    c6.metric(
+        "Średnia liczba paczek w systemie",
+        f'{T["L"]:.3f}' if theory else "—",
+        f'symulacja: {result["avg_in_system"]:.3f}', delta_color="off",
+    )
 
-        st.subheader("Status poszczególnych robotów w czasie (co 1s)")
-        st.caption("Wartość **1** oznacza stan **zajęty** (obsługa zgłoszenia), **0** oznacza stan **wolny**.")
+    c7, c8 = st.columns(2)
+    c7.metric(
+        "Średni czas oczekiwania",
+        f'{T["Wq"]:.3f} s' if theory else "—",
+        f'symulacja: {result["avg_wait"]:.3f} s', delta_color="off",
+    )
+    c8.metric(
+        "Średni czas w systemie",
+        f'{T["W"]:.3f} s' if theory else "—",
+        f'symulacja: {result["avg_system"]:.3f} s', delta_color="off",
+    )
 
-        for r in range(int(m)):
-            col_name = f"Robot {r + 1}"
-            df_single_robot = df_robots_seconds[[col_name]]
-            
-            st.markdown(f"##### {col_name}")
-            st.line_chart(
-                df_single_robot,
-                x_label="Czas symulacji [s]",
-                y_label="Status (0/1)",
-                height=180
-            )
+    st.subheader("Roboty")
+    robots = pd.DataFrame({
+        "μᵢ": mus,
+        "Wykorzystanie (teoria)": [f"{u:.2%}" for u in T["util"]] if theory else ["—"] * m,
+        "Wykorzystanie (symulacja)": [f"{u:.2%}" for u in result["util"]],
+        "Obsłużone paczki / s (teoria)": [f"{u * mu:.3f}" for u, mu in zip(T["util"], mus)] if theory else ["—"] * m,
+        "Obsłużone paczki (symulacja)": result["completed_per_robot"],
+    }, index=[f"Robot {r + 1}" for r in range(m)])
+    st.dataframe(robots, use_container_width=True)
 
-        with st.expander("Zobacz tabelę stanów robotów sekunda po sekundzie"):
-            st.dataframe(df_robots_seconds, use_container_width=True)
+    if theory:
+        st.subheader("Rozkład liczby paczek w systemie (teoria)")
+        dist = T["dist"].rename("Prawdopodobieństwo")
+        dist.index.name = "Liczba paczek w systemie"
+        st.bar_chart(dist)
 
+    st.divider()
 
-        st.subheader("Rozkład czasów oczekiwania")
+    # ---------------- Przebieg symulacji ----------------
+    second_grid = list(range(int(sim_time) + 1))
 
-        if result["waiting_times"]:
-            total_samples = len(result["waiting_times"])
+    df_q = pd.DataFrame(result["queue_history"], columns=["Czas", "Długość kolejki"]).drop_duplicates(subset=["Czas"], keep="last")
+    df_s = pd.DataFrame(result["system_history"], columns=["Czas", "Liczba paczek w systemie"]).drop_duplicates(subset=["Czas"], keep="last")
 
-            s_wait = pd.Series(result["waiting_times"])
-            bins = pd.cut(s_wait, bins=15)
-            counts = bins.value_counts().sort_index()
-            counts.index = [f"{interval.left:.1f} – {interval.right:.1f} s" for interval in counts.index]
-            
-            df_chart = pd.DataFrame({"Liczba paczek": counts})
-            st.bar_chart(df_chart)
+    all_times_sys = sorted(set(second_grid).union(df_q["Czas"]).union(df_s["Czas"]))
+    df_sys_combined = pd.DataFrame(index=all_times_sys)
+    df_sys_combined = df_sys_combined.join(df_q.set_index("Czas")).join(df_s.set_index("Czas"))
+    df_sys_combined = df_sys_combined.ffill().fillna(0)
 
-            # Suma próbek pod wykresem
-            st.caption(f"**Łączna liczba zarejestrowanych próbek w rozkładzie:** {total_samples}")
-        else:
-            st.info("Brak zarejestrowanych czasów oczekiwania.")
+    df_system_seconds = df_sys_combined.loc[second_grid]
+    df_system_seconds.index.name = "Czas [s]"
+
+    st.subheader("Przebieg symulacji magazynu (próbkowanie co 1s)")
+    st.line_chart(df_system_seconds, x_label="Czas symulacji [s]", y_label="Liczba paczek", height=400)
+
+    df_robots_seconds = pd.DataFrame(index=second_grid)
+    df_robots_seconds.index.name = "Czas [s]"
+
+    for r in range(m):
+        r_df = pd.DataFrame(result["robot_history"][r], columns=["Czas", f"Robot {r+1}"]).drop_duplicates(subset=["Czas"], keep="last")
+        all_r_times = sorted(set(second_grid).union(r_df["Czas"]))
+        r_combined = pd.DataFrame(index=all_r_times).join(r_df.set_index("Czas")).ffill().fillna(0)
+        df_robots_seconds[f"Robot {r+1}"] = r_combined.loc[second_grid, f"Robot {r+1}"].astype(int)
+
+    st.subheader("Status poszczególnych robotów w czasie (co 1s)")
+    st.caption("Wartość **1** oznacza stan **zajęty** (obsługa zgłoszenia), **0** oznacza stan **wolny**.")
+
+    for r in range(m):
+        col_name = f"Robot {r + 1}"
+        st.markdown(f"##### {col_name} (μ = {mus[r]})")
+        st.line_chart(df_robots_seconds[[col_name]], x_label="Czas symulacji [s]", y_label="Status (0/1)", height=180)
+
+    with st.expander("Zobacz tabelę stanów robotów sekunda po sekundzie"):
+        st.dataframe(df_robots_seconds, use_container_width=True)
+
+    st.subheader("Rozkład czasów oczekiwania")
+    if result["waiting_times"]:
+        s_wait = pd.Series(result["waiting_times"])
+        counts = pd.cut(s_wait, bins=15).value_counts().sort_index()
+        counts.index = [f"{interval.left:.1f} – {interval.right:.1f} s" for interval in counts.index]
+        st.bar_chart(pd.DataFrame({"Liczba paczek": counts}))
+        st.caption(f"**Łączna liczba zarejestrowanych próbek w rozkładzie:** {len(s_wait)}")
+    else:
+        st.info("Brak zarejestrowanych czasów oczekiwania.")
