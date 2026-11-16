@@ -4,14 +4,15 @@ import heapq
 import pandas as pd
 from collections import deque
 
-# Symulator zamkniętego systemu kolejkowego z obsługą indywidualną (przykład magazynu)
-# M/M_i/m/FIFO/N/F  -  każdy robot ma własną intensywność obsługi μ_i
+# Symulator zamkniętego systemu kolejkowego (przykład magazynu). Do wyboru:
+#   - system zamknięty                       M/M/m/FIFO/N/F   - wszystkie roboty mają to samo μ
+#   - system zamknięty z obsługą indywidualną M/M_i/m/FIFO/N/F - każdy robot ma własne μ_i
 #
 # kanały obsługi       - roboty w magazynie (robot i obsługuje z intensywnością μ_i)
 # źródła zgłoszeń      - doki/bramy magazynowe (każdy generuje paczki z intensywnością λ)
 # N                    - maks. liczba paczek w systemie (w obsłudze + w kolejce)
 #
-# Ponieważ roboty są różne, liczy się KTÓRY robot dostaje paczkę. Reguła przydziału:
+# W obsłudze indywidualnej roboty są różne, więc liczy się KTÓRY robot dostaje paczkę. Reguła przydziału:
 #   - "Kolejność robotów"  - pierwszy wolny robot wg numeru (robot 1 ma pierwszeństwo)
 #   - "Najszybszy wolny"   - wolny robot o największym μ_i
 #
@@ -158,12 +159,21 @@ def simulate(F, m, N, lam, mus, rule, sim_time, seed):
 
 st.set_page_config(page_title="Symulator magazynu", layout="wide")
 
+SYSTEM_CLOSED = "System zamknięty"
+SYSTEM_INDIVIDUAL = "System zamknięty z obsługą indywidualną"
+
+SYSTEM_DESCRIPTIONS = {
+    SYSTEM_CLOSED: "Zamknięty system M/M/m/FIFO/N/F – wszystkie roboty mają tę samą intensywność obsługi μ.",
+    SYSTEM_INDIVIDUAL: "Zamknięty system z **obsługą indywidualną** M/M<sub>i</sub>/m/FIFO/N/F – "
+                       "każdy robot ma własną intensywność obsługi μ<sub>i</sub>.",
+}
+
 st.title("Symulator systemu kolejkowego magazynu")
-st.markdown(
-    "Zamknięty system z **obsługą indywidualną** M/M<sub>i</sub>/m/FIFO/N/F – "
-    "każdy robot ma własną intensywność obsługi μ<sub>i</sub>.",
-    unsafe_allow_html=True,
-)
+
+st.sidebar.header("Rodzaj systemu")
+system = st.sidebar.radio("Rodzaj systemu", [SYSTEM_CLOSED, SYSTEM_INDIVIDUAL], label_visibility="collapsed")
+
+st.markdown(SYSTEM_DESCRIPTIONS[system], unsafe_allow_html=True)
 
 st.sidebar.header("Parametry symulacji")
 F = st.sidebar.number_input("Liczba punktów odbioru (F)", min_value=1, max_value=1000, value=10)
@@ -171,17 +181,22 @@ m = st.sidebar.number_input("Liczba robotów (m)", min_value=1, max_value=100, v
 N = st.sidebar.number_input("Pojemność systemu (N)", min_value=1, max_value=1000, value=20)
 lam = st.sidebar.number_input("Intensywność generowania paczek λ (na dok)", min_value=0.01, max_value=100.0, value=0.5, step=0.1)
 
-st.sidebar.subheader("Intensywność obsługi robotów μᵢ")
-mus = []
-for r in range(int(m)):
-    mus.append(st.sidebar.number_input(
-        f"Robot {r + 1}: μ{r + 1}",
-        min_value=0.01, max_value=100.0,
-        value=round(max(0.2, 1.0 - 0.2 * r), 2), step=0.1,
-        key=f"mu_{r}",
-    ))
-
-rule = st.sidebar.radio("Przydział paczki do wolnego robota", [RULE_ORDER, RULE_FASTEST])
+if system == SYSTEM_CLOSED:
+    mu = st.sidebar.number_input("Intensywność obsługi paczek μ", min_value=0.01, max_value=100.0, value=1.0, step=0.1)
+    mus = [mu] * int(m)
+    rule = RULE_ORDER          # roboty są jednakowe, więc reguła przydziału nie ma znaczenia
+else:
+    st.sidebar.subheader("Intensywność obsługi robotów μᵢ")
+    mus = []
+    for r in range(int(m)):
+        mus.append(st.sidebar.number_input(
+            f"Robot {r + 1}: μ{r + 1}",
+            min_value=0.01, max_value=100.0,
+            value=round(max(0.2, 1.0 - 0.2 * r), 2), step=0.1,
+            key=f"mu_{r}",
+        ))
+    st.sidebar.caption(f"Średnia μᵢ = {sum(mus) / len(mus):.3f}")
+    rule = st.sidebar.radio("Przydział paczki do wolnego robota", [RULE_ORDER, RULE_FASTEST])
 
 sim_time = st.sidebar.number_input("Czas symulacji [s]", min_value=1, max_value=100000, value=1000)
 seed = st.sidebar.number_input("Ziarno generatora losowego", min_value=0, max_value=999999, value=42)
@@ -200,7 +215,7 @@ if run:
     st.success("Symulacja została zakończona!")
 
     # ---------------- Wyniki ----------------
-    st.header("Wyniki symulacji")
+    st.header(f"Wyniki symulacji – {system.lower()}")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Obsłużone paczki", result["completed"])
