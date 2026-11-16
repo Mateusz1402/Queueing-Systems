@@ -1,7 +1,6 @@
 import streamlit as st
 import random
 import heapq
-import numpy as np
 import pandas as pd
 from collections import deque
 
@@ -22,8 +21,6 @@ from collections import deque
 RULE_ORDER = "Kolejność robotów (robot 1 ma pierwszeństwo)"
 RULE_FASTEST = "Najszybszy wolny robot (największe μ)"
 
-MAX_STATES = 6000
-
 
 def robot_priority(mus, rule):
     """Kolejność, w jakiej sprawdzamy wolne roboty przy przydziale paczki."""
@@ -32,120 +29,6 @@ def robot_priority(mus, rule):
         # stabilne sortowanie: przy równych μ decyduje numer robota
         order.sort(key=lambda r: -mus[r])
     return order
-
-
-# ---------------------------------------------------------------------------
-# Rozwiązanie analityczne - łańcuch Markowa z czasem ciągłym
-# ---------------------------------------------------------------------------
-# Stan: (b, q, k)
-#   b - krotka 0/1, który robot jest zajęty
-#   q - liczba paczek w kolejce
-#   k - liczba doków zablokowanych (paczka czeka przed pełnym systemem)
-# Rozwiązujemy równania równowagi  π Q = 0,  Σ π = 1.
-
-def analytic(F, m, N, lam, mus, rule):
-    order = robot_priority(mus, rule)
-
-    def first_free(b):
-        for r in order:
-            if not b[r]:
-                return r
-        return None
-
-    def enter(b, q):
-        """Paczka wchodzi do systemu: do wolnego robota albo do kolejki."""
-        r = first_free(b)
-        if r is None:
-            return b, q + 1
-        nb = list(b)
-        nb[r] = 1
-        return tuple(nb), q
-
-    def transitions(state):
-        b, q, k = state
-        n = sum(b) + q
-        out = []
-
-        # Nowe zgłoszenie z jednego z "aktywnych" doków
-        rate = (F - n - k) * lam
-        if rate > 0:
-            if n < N:
-                nb, nq = enter(b, q)
-                out.append(((nb, nq, k), rate))
-            else:
-                out.append(((b, q, k + 1), rate))
-
-        # Zakończenie obsługi przez robota i
-        for i in range(m):
-            if b[i]:
-                nb = list(b)
-                nb[i] = 0
-                nb = tuple(nb)
-                nq, nk = q, k
-                if nk > 0:                 # zablokowana paczka wchodzi do kolejki
-                    nk -= 1
-                    nq += 1
-                if nq > 0:                 # wolny robot bierze paczkę z kolejki
-                    nb, nq = enter(nb, nq - 1)
-                out.append(((nb, nq, nk), mus[i]))
-        return out
-
-    start = (tuple([0] * m), 0, 0)
-    index = {start: 0}
-    states = [start]
-    edges = []
-    i = 0
-    while i < len(states):
-        for target, rate in transitions(states[i]):
-            if target not in index:
-                if len(states) >= MAX_STATES:
-                    return None
-                index[target] = len(states)
-                states.append(target)
-            edges.append((i, index[target], rate))
-        i += 1
-
-    S = len(states)
-    Q = np.zeros((S, S))
-    for a, c, rate in edges:
-        Q[a, c] += rate
-        Q[a, a] -= rate
-
-    A = Q.T.copy()
-    A[-1, :] = 1.0
-    rhs = np.zeros(S)
-    rhs[-1] = 1.0
-    pi = np.linalg.solve(A, rhs)
-
-    busy = np.array([s[0] for s in states], dtype=float)   # S x m
-    q_arr = np.array([s[1] for s in states], dtype=float)
-    k_arr = np.array([s[2] for s in states], dtype=float)
-    n_arr = busy.sum(axis=1) + q_arr
-
-    util = pi @ busy                                       # P(robot i zajęty)
-    throughput = float(np.dot(util, mus))                  # paczek / s
-    L = float(pi @ n_arr)
-    Lq = float(pi @ q_arr)
-    K = float(pi @ k_arr)
-    p0 = float(pi[n_arr == 0].sum())
-
-    dist = pd.Series(pi).groupby(n_arr.astype(int)).sum()
-
-    return {
-        "states": S,
-        "p0": p0,
-        "util": util,
-        "avg_busy": float(util.sum()),
-        "throughput": throughput,
-        "L": L,
-        "Lq": Lq,
-        "K": K,
-        # Little: czas oczekiwania liczony od wygenerowania paczki przez dok
-        # (wliczamy czas czekania przed pełnym systemem - tak jak w symulacji)
-        "Wq": (Lq + K) / throughput if throughput > 0 else 0.0,
-        "W": (L + K) / throughput if throughput > 0 else 0.0,
-        "dist": dist,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -311,86 +194,37 @@ if run:
     lam = float(lam)
     mus = [float(x) for x in mus]
 
-    with st.spinner("Trwa obliczanie i symulacja..."):
-        theory = analytic(F, m, N, lam, mus, rule)
+    with st.spinner("Trwa symulacja procesu magazynowania..."):
         result = simulate(F, m, N, lam, mus, rule, sim_time, seed)
 
     st.success("Symulacja została zakończona!")
 
-    # ---------------- Rozwiązanie analityczne vs symulacja ----------------
-    st.header("Rozwiązanie systemu")
+    # ---------------- Wyniki ----------------
+    st.header("Wyniki symulacji")
 
-    if theory is None:
-        st.warning(
-            f"Przestrzeń stanów przekracza {MAX_STATES} stanów – rozwiązanie analityczne "
-            "pominięte (zmniejsz liczbę robotów m). Poniżej tylko wyniki symulacji."
-        )
-    else:
-        st.caption(f"Rozwiązanie analityczne: łańcuch Markowa, {theory['states']} stanów, stan ustalony.")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Obsłużone paczki", result["completed"])
+    c2.metric("Średni czas oczekiwania", f'{result["avg_wait"]:.2f} s')
+    c3.metric("Średni czas w systemie", f'{result["avg_system"]:.2f} s')
+    c4.metric("Średnia liczba obsłużonych paczek", f'{result["throughput"]:.3f} /s')
 
-    T = theory or {}
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("P₀ – brak zgłoszeń, roboty bez pracy", f'{result["p0"]:.4f}')
+    c6.metric("Średnia liczba zajętych robotów", f'{result["avg_busy"]:.3f}')
+    c7.metric("Średnia długość kolejki", f'{result["avg_queue"]:.2f}')
+    c8.metric("Średnia liczba paczek w systemie", f'{result["avg_in_system"]:.2f}')
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric(
-        "P₀ – brak zgłoszeń, wszystkie roboty bez pracy",
-        f'{T["p0"]:.4f}' if theory else "—",
-        f'symulacja: {result["p0"]:.4f}', delta_color="off",
-    )
-    c2.metric(
-        "Średnia liczba paczek w obsłudze (zajętych robotów)",
-        f'{T["avg_busy"]:.3f}' if theory else "—",
-        f'symulacja: {result["avg_busy"]:.3f}', delta_color="off",
-    )
-    c3.metric(
-        "Średnia liczba obsłużonych paczek [1/s]",
-        f'{T["throughput"]:.3f}' if theory else "—",
-        f'symulacja: {result["throughput"]:.3f}', delta_color="off",
-    )
-
-    c4, c5, c6 = st.columns(3)
-    c4.metric(
-        f"Oczekiwana liczba obsłużonych paczek w {sim_time:.0f} s",
-        f'{T["throughput"] * sim_time:.1f}' if theory else "—",
-        f'symulacja: {result["completed"]}', delta_color="off",
-    )
-    c5.metric(
-        "Średnia długość kolejki",
-        f'{T["Lq"]:.3f}' if theory else "—",
-        f'symulacja: {result["avg_queue"]:.3f}', delta_color="off",
-    )
-    c6.metric(
-        "Średnia liczba paczek w systemie",
-        f'{T["L"]:.3f}' if theory else "—",
-        f'symulacja: {result["avg_in_system"]:.3f}', delta_color="off",
-    )
-
-    c7, c8 = st.columns(2)
-    c7.metric(
-        "Średni czas oczekiwania",
-        f'{T["Wq"]:.3f} s' if theory else "—",
-        f'symulacja: {result["avg_wait"]:.3f} s', delta_color="off",
-    )
-    c8.metric(
-        "Średni czas w systemie",
-        f'{T["W"]:.3f} s' if theory else "—",
-        f'symulacja: {result["avg_system"]:.3f} s', delta_color="off",
-    )
+    c9, c10 = st.columns(2)
+    c9.metric("Paczki w systemie na koniec", result["remaining"])
+    c10.metric("Paczki w kolejce na koniec", result["remaining_queue"])
 
     st.subheader("Roboty")
     robots = pd.DataFrame({
         "μᵢ": mus,
-        "Wykorzystanie (teoria)": [f"{u:.2%}" for u in T["util"]] if theory else ["—"] * m,
-        "Wykorzystanie (symulacja)": [f"{u:.2%}" for u in result["util"]],
-        "Obsłużone paczki / s (teoria)": [f"{u * mu:.3f}" for u, mu in zip(T["util"], mus)] if theory else ["—"] * m,
-        "Obsłużone paczki (symulacja)": result["completed_per_robot"],
+        "Wykorzystanie": [f"{u:.2%}" for u in result["util"]],
+        "Obsłużone paczki": result["completed_per_robot"],
     }, index=[f"Robot {r + 1}" for r in range(m)])
     st.dataframe(robots, use_container_width=True)
-
-    if theory:
-        st.subheader("Rozkład liczby paczek w systemie (teoria)")
-        dist = T["dist"].rename("Prawdopodobieństwo")
-        dist.index.name = "Liczba paczek w systemie"
-        st.bar_chart(dist)
 
     st.divider()
 
